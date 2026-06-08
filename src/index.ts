@@ -188,6 +188,36 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ---- get_attachment ----
+server.tool(
+  "get_attachment",
+  "Download a Gmail attachment and return its base64-encoded content.",
+  {
+    account: z
+      .string()
+      .describe("Email address of the account this message belongs to"),
+    message_id: z.string().describe("The Gmail message ID"),
+    attachment_id: z.string().describe("The attachment ID to download"),
+    filename: z.string().optional().describe("The filename of the attachment"),
+  },
+  async ({ account, message_id, attachment_id, filename }) => {
+    const gmail = await getGmailServiceForAccount(account);
+    const response = await gmail.getAttachment(message_id, attachment_id);
+    const standardBase64 = response.replace(/-/g, "+").replace(/_/g, "/");
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            filename: filename || "attachment",
+            base64Data: standardBase64,
+          }),
+        },
+      ],
+    };
+  }
+);
+
   // ---- archive_email ----
   server.tool(
     "archive_email",
