@@ -547,7 +547,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
       sessionIdGenerator: undefined, // stateless — no session tracking
     });
 
-    const mcpServer = createMcpServer();
+    const mcpServer = createMcpServerWithShiftCare();
     await mcpServer.connect(transport);
 
     await transport.handleRequest(req, res, req.body);
@@ -588,6 +588,138 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ShiftCare MCP tools — server-side proxy to avoid CORS
+// ---------------------------------------------------------------------------
+
+const SHIFTCARE_BASE = "https://api.shiftcare.com/api/v3";
+const SHIFTCARE_ACCOUNT_ID = "15940";
+
+function scAuth(): string {
+  const key = process.env.SHIFTCARE_API_KEY || "";
+  return "Basic " + Buffer.from(`${SHIFTCARE_ACCOUNT_ID}:${key}`).toString("base64");
+}
+
+async function scRequest(method: string, path: string, body?: any): Promise<any> {
+  const opts: any = {
+    method,
+    headers: { "Authorization": scAuth(), "Content-Type": "application/json" },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${SHIFTCARE_BASE}${path}`, opts);
+  return res.json();
+}
+
+// Register ShiftCare tools on every MCP server instance
+const originalCreateMcpServer = createMcpServer;
+function createMcpServerWithShiftCare(): McpServer {
+  const server = originalCreateMcpServer();
+
+  // ---- shiftcare_create_client ----
+  server.tool(
+    "shiftcare_create_client",
+    "Create a new NDIS client profile in ShiftCare.",
+    {
+      first_name: z.string().describe("Client first name"),
+      last_name: z.string().describe("Client last name"),
+      preferred_name: z.string().optional().describe("Preferred name"),
+      date_of_birth: z.string().optional().describe("DOB in YYYY-MM-DD format"),
+      ndis_number: z.string().optional().describe("NDIS number"),
+      gender: z.string().optional().describe("Gender"),
+      address: z.string().optional().describe("Full address"),
+      email: z.string().optional().describe("Email address"),
+      phone: z.string().optional().describe("Phone number"),
+    },
+    async (args) => {
+      const result = await scRequest("POST", `/clients?account_id=${SHIFTCARE_ACCOUNT_ID}`, {
+        account_id: SHIFTCARE_ACCOUNT_ID,
+        client_status: "active",
+        client_type: "ndis",
+        ...args,
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ---- shiftcare_update_client ----
+  server.tool(
+    "shiftcare_update_client",
+    "Update an existing ShiftCare client profile.",
+    {
+      client_id: z.string().describe("ShiftCare client ID"),
+      first_name: z.string().optional(),
+      last_name: z.string().optional(),
+      preferred_name: z.string().optional(),
+      date_of_birth: z.string().optional().describe("YYYY-MM-DD"),
+      ndis_number: z.string().optional(),
+      gender: z.string().optional(),
+      address: z.string().optional(),
+      email: z.string().optional(),
+      phone: z.string().optional(),
+      client_status: z.string().optional().describe("active, prospect, inactive etc"),
+    },
+    async ({ client_id, ...fields }) => {
+      const result = await scRequest("PATCH", `/clients/${client_id}?account_id=${SHIFTCARE_ACCOUNT_ID}`, {
+        account_id: SHIFTCARE_ACCOUNT_ID,
+        ...fields,
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ---- shiftcare_add_contact ----
+  server.tool(
+    "shiftcare_add_contact",
+    "Add a contact to a ShiftCare client profile (primary, billing, or emergency).",
+    {
+      client_id: z.string().describe("ShiftCare client ID"),
+      name: z.string().describe("Contact full name"),
+      relationship: z.string().describe("e.g. Mother, Father, Step Parent, Plan Manager, Guardian"),
+      email: z.string().optional(),
+      phone: z.string().optional(),
+      is_primary: z.boolean().optional().describe("Set as primary contact"),
+      is_billing_contact: z.boolean().optional().describe("Set as billing contact"),
+      is_emergency_contact: z.boolean().optional().describe("Set as emergency contact"),
+      family_portal_access: z.boolean().optional().describe("Enable family portal access (do not send invite)"),
+    },
+    async ({ client_id, ...contact }) => {
+      const result = await scRequest("POST", `/clients/${client_id}/contacts?account_id=${SHIFTCARE_ACCOUNT_ID}`, {
+        account_id: SHIFTCARE_ACCOUNT_ID,
+        ...contact,
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ---- shiftcare_search_clients ----
+  server.tool(
+    "shiftcare_search_clients",
+    "Search for clients in ShiftCare by name.",
+    {
+      name: z.string().describe("Name or partial name to search for"),
+    },
+    async ({ name }) => {
+      const result = await scRequest("GET", `/clients?account_id=${SHIFTCARE_ACCOUNT_ID}&filter_by_name=${encodeURIComponent(name)}`);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ---- shiftcare_get_client ----
+  server.tool(
+    "shiftcare_get_client",
+    "Get full details of a ShiftCare client by ID.",
+    {
+      client_id: z.string().describe("ShiftCare client ID"),
+    },
+    async ({ client_id }) => {
+      const result = await scRequest("GET", `/clients/${client_id}?account_id=${SHIFTCARE_ACCOUNT_ID}`);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  return server;
+}
 
 app.listen(PORT, () => {
   console.log(`Gmail MCP server listening on port ${PORT}`);
