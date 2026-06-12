@@ -7,6 +7,19 @@ import { GmailService } from "./gmail-service.js";
 import { TokenStore } from "./token-store.js";
 
 // ---------------------------------------------------------------------------
+// Global error handlers — prevent unhandled rejections from crashing the process
+// ---------------------------------------------------------------------------
+
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] Uncaught exception:", err);
+  // Don't exit — log and keep running so Railway doesn't cycle restart loops
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] Unhandled promise rejection:", reason);
+});
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -20,6 +33,27 @@ const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/userinfo.email",
 ];
+
+function validateConfig(): void {
+  const required: Record<string, string | undefined> = {
+    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+    ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
+    ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,
+    SERVER_URL: process.env.SERVER_URL,
+  };
+  const missing = Object.entries(required)
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+  if (missing.length > 0) {
+    console.error(
+      `[startup] Missing required environment variables: ${missing.join(", ")}`
+    );
+    console.error(
+      "[startup] Server will start but OAuth and token operations will fail."
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -84,7 +118,7 @@ function resolveAccounts(account: string): string[] {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "gmail-mcp-server",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   // ---- list_accounts ----
@@ -138,7 +172,7 @@ function createMcpServer(): McpServer {
     },
     async ({ account, query, max_results }) => {
       const accounts = resolveAccounts(account);
-      const allResults: Array<{ account: string; emails: any[] }> = [];
+      const allResults: Array<{ account: string; emails: any[]; error?: string }> = [];
 
       for (const email of accounts) {
         try {
@@ -146,10 +180,7 @@ function createMcpServer(): McpServer {
           const emails = await gmail.listEmails(query, max_results);
           allResults.push({ account: email, emails });
         } catch (err: any) {
-          allResults.push({
-            account: email,
-            emails: [],
-          });
+          allResults.push({ account: email, emails: [], error: err.message });
         }
       }
 
@@ -189,34 +220,188 @@ function createMcpServer(): McpServer {
   );
 
   // ---- get_attachment ----
-server.tool(
-  "get_attachment",
-  "Download a Gmail attachment and return its base64-encoded content.",
-  {
-    account: z
-      .string()
-      .describe("Email address of the account this message belongs to"),
-    message_id: z.string().describe("The Gmail message ID"),
-    attachment_id: z.string().describe("The attachment ID to download"),
-    filename: z.string().optional().describe("The filename of the attachment"),
-  },
-  async ({ account, message_id, attachment_id, filename }) => {
-    const gmail = await getGmailServiceForAccount(account);
-    const response = await gmail.getAttachment(message_id, attachment_id);
-    const standardBase64 = response.replace(/-/g, "+").replace(/_/g, "/");
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify({
-            filename: filename || "attachment",
-            base64Data: standardBase64,
-          }),
-        },
-      ],
-    };
-  }
-);
+  server.tool(
+    "get_attachment",
+    "Download a Gmail attachment and return its base64-encoded content.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID"),
+      attachment_id: z.string().describe("The attachment ID to download"),
+      filename: z.string().optional().describe("The filename of the attachment"),
+    },
+    async ({ account, message_id, attachment_id, filename }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const response = await gmail.getAttachment(message_id, attachment_id);
+      const standardBase64 = response.replace(/-/g, "+").replace(/_/g, "/");
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              filename: filename || "attachment",
+              base64Data: standardBase64,
+            }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- send_email ----
+  server.tool(
+    "send_email",
+    "Compose and send a new email from the specified Gmail account.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account to send from"),
+      to: z
+        .string()
+        .describe(
+          "Recipient email address(es). Separate multiple addresses with commas."
+        ),
+      subject: z.string().describe("Email subject line"),
+      body: z.string().describe("Plain text email body"),
+      cc: z
+        .string()
+        .optional()
+        .describe("CC recipient(s), comma-separated"),
+      bcc: z
+        .string()
+        .optional()
+        .describe("BCC recipient(s), comma-separated"),
+    },
+    async ({ account, to, subject, body, cc, bcc }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.sendEmail(to, subject, body, cc, bcc);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              ...result,
+              message: `Email sent successfully to ${to}.`,
+            }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- reply_to_email ----
+  server.tool(
+    "reply_to_email",
+    "Reply to an existing email, preserving the thread. Automatically sets In-Reply-To and References headers.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account to reply from"),
+      message_id: z
+        .string()
+        .describe("The Gmail message ID of the email to reply to"),
+      body: z.string().describe("Plain text reply body"),
+      reply_all: z
+        .boolean()
+        .default(false)
+        .describe("If true, reply to all recipients (Reply All)"),
+    },
+    async ({ account, message_id, body, reply_all }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.replyToEmail(message_id, body, reply_all);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              ...result,
+              message: "Reply sent successfully.",
+            }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- mark_as_read ----
+  server.tool(
+    "mark_as_read",
+    "Mark an email as read (removes the UNREAD label).",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID"),
+    },
+    async ({ account, message_id }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.markAsRead(message_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, message_id, ...result }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- mark_as_unread ----
+  server.tool(
+    "mark_as_unread",
+    "Mark an email as unread (adds the UNREAD label).",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID"),
+    },
+    async ({ account, message_id }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.markAsUnread(message_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ account, message_id, ...result }),
+          },
+        ],
+      };
+    }
+  );
+
+  // ---- delete_email ----
+  server.tool(
+    "delete_email",
+    "Move an email to the Trash. It can be recovered from Trash within 30 days.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID to trash"),
+    },
+    async ({ account, message_id }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.trashEmail(message_id);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              message_id,
+              ...result,
+              message: `Email ${message_id} moved to Trash.`,
+            }),
+          },
+        ],
+      };
+    }
+  );
 
   // ---- archive_email ----
   server.tool(
@@ -279,6 +464,37 @@ server.tool(
     }
   );
 
+  // ---- remove_label ----
+  server.tool(
+    "remove_label",
+    "Remove a custom label from an email.",
+    {
+      account: z
+        .string()
+        .describe("Email address of the account this message belongs to"),
+      message_id: z.string().describe("The Gmail message ID"),
+      label_name: z
+        .string()
+        .describe("Label name to remove (e.g. 'Receipts', 'Follow Up')"),
+    },
+    async ({ account, message_id, label_name }) => {
+      const gmail = await getGmailServiceForAccount(account);
+      const result = await gmail.removeLabel(message_id, label_name);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              account,
+              ...result,
+              message: `Label "${label_name}" removed from email ${message_id}.`,
+            }),
+          },
+        ],
+      };
+    }
+  );
+
   // ---- unsubscribe_email ----
   server.tool(
     "unsubscribe_email",
@@ -329,7 +545,7 @@ server.tool(
     },
     async ({ account, query, max_results }) => {
       const accounts = resolveAccounts(account);
-      const allResults: Array<{ account: string; emails: any[] }> = [];
+      const allResults: Array<{ account: string; emails: any[]; error?: string }> = [];
 
       for (const email of accounts) {
         try {
@@ -337,7 +553,7 @@ server.tool(
           const emails = await gmail.batchProcess(query, max_results);
           allResults.push({ account: email, emails });
         } catch (err: any) {
-          allResults.push({ account: email, emails: [] });
+          allResults.push({ account: email, emails: [], error: err.message });
         }
       }
 
@@ -378,8 +594,8 @@ app.use(express.urlencoded({ extended: true }));
 
 function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   const key =
-    req.query.key as string | undefined ??
-    req.headers["x-admin-key"] as string | undefined;
+    (req.query.key as string | undefined) ??
+    (req.headers["x-admin-key"] as string | undefined);
 
   if (key !== ADMIN_PASSWORD) {
     res.status(401).send(`
@@ -405,10 +621,11 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
   const key = _req.query.key as string;
   const message = _req.query.message as string | undefined;
 
-  const accountRows = accounts.length > 0
-    ? accounts
-        .map(
-          (a) => `
+  const accountRows =
+    accounts.length > 0
+      ? accounts
+          .map(
+            (a) => `
         <tr>
           <td>${a.email}</td>
           <td>${new Date(a.addedAt).toLocaleDateString()}</td>
@@ -419,9 +636,9 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
             </form>
           </td>
         </tr>`
-        )
-        .join("")
-    : `<tr><td colspan="3" style="text-align:center;color:#888">No accounts connected yet</td></tr>`;
+          )
+          .join("")
+      : `<tr><td colspan="3" style="text-align:center;color:#888">No accounts connected yet</td></tr>`;
 
   res.send(`
     <!DOCTYPE html>
@@ -448,14 +665,18 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
         <tbody>${accountRows}</tbody>
       </table>
       <a class="btn" href="/oauth/start?key=${encodeURIComponent(key)}">+ Add Gmail Account</a>
-      ${accounts.length > 0 ? `
+      ${
+        accounts.length > 0
+          ? `
       <div style="margin-top:24px;padding:16px;background:#fff3cd;border-radius:6px">
         <strong>Important:</strong> After adding/removing accounts, copy the value below and paste it as the <code>TOKENS_DATA</code> environment variable in Railway. This ensures accounts survive redeploys.
         <div style="margin-top:8px">
           <textarea readonly style="width:100%;height:60px;font-family:monospace;font-size:11px;box-sizing:border-box" onclick="this.select()">${tokenStore.getTokensDataForExport()}</textarea>
         </div>
       </div>
-      ` : ""}
+      `
+          : ""
+      }
       <hr style="margin-top:40px;border:none;border-top:1px solid #eee" />
       <p style="color:#888;font-size:13px">
         MCP endpoint: <code>${SERVER_URL}/mcp</code><br/>
@@ -472,9 +693,13 @@ app.post("/setup/remove", requireAdmin, (req: Request, res: Response) => {
 
   if (email && tokenStore.hasAccount(email)) {
     tokenStore.removeAccount(email);
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent(`Removed ${email}`)}`);
+    res.redirect(
+      `/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent(`Removed ${email}`)}`
+    );
   } else {
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent("Account not found")}`);
+    res.redirect(
+      `/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent("Account not found")}`
+    );
   }
 });
 
@@ -494,7 +719,7 @@ app.get("/oauth/start", (req: Request, res: Response) => {
     access_type: "offline",
     prompt: "consent",
     scope: SCOPES,
-    state: key, // pass admin key through OAuth flow
+    state: key,
   });
 
   res.redirect(url);
@@ -530,7 +755,6 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
       return;
     }
 
-    // Get the user's email address
     oauth2.setCredentials(tokens);
     const oauth2Api = google.oauth2({ version: "v2", auth: oauth2 });
     const userInfo = await oauth2Api.userinfo.get();
@@ -564,6 +788,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     accounts: tokenStore.size,
+    uptime: Math.floor(process.uptime()),
   });
 });
 
@@ -574,7 +799,7 @@ app.get("/health", (_req, res) => {
 app.post("/mcp", async (req: Request, res: Response) => {
   try {
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless — no session tracking
+      sessionIdGenerator: undefined,
     });
 
     const mcpServer = createMcpServer();
@@ -582,7 +807,6 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
     await transport.handleRequest(req, res, req.body);
 
-    // Clean up after response is sent
     res.on("close", () => {
       mcpServer.close().catch(() => {});
       transport.close().catch(() => {});
@@ -599,18 +823,24 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", async (req: Request, res: Response) => {
+app.get("/mcp", async (_req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
-    error: { code: -32000, message: "SSE streams not supported in stateless mode. Use POST." },
+    error: {
+      code: -32000,
+      message: "SSE streams not supported in stateless mode. Use POST.",
+    },
     id: null,
   });
 });
 
-app.delete("/mcp", async (req: Request, res: Response) => {
+app.delete("/mcp", async (_req: Request, res: Response) => {
   res.status(405).json({
     jsonrpc: "2.0",
-    error: { code: -32000, message: "Session management not used in stateless mode." },
+    error: {
+      code: -32000,
+      message: "Session management not used in stateless mode.",
+    },
     id: null,
   });
 });
@@ -618,6 +848,8 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+
+validateConfig();
 
 app.listen(PORT, () => {
   console.log(`Gmail MCP server listening on port ${PORT}`);
