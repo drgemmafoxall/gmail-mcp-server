@@ -14,6 +14,12 @@ export interface EmailSummary {
   labelIds: string[];
 }
 
+export interface AttachmentMeta {
+  filename: string;
+  attachmentId: string;
+  mimeType: string;
+}
+
 export interface EmailDetail {
   id: string;
   threadId: string;
@@ -26,6 +32,7 @@ export interface EmailDetail {
   labelIds: string[];
   headers: Record<string, string>;
   unsubscribeLinks: string[];
+  attachments: AttachmentMeta[];
 }
 
 export interface UnsubscribeResult {
@@ -119,6 +126,7 @@ export class GmailService {
 
     const body = this.extractBody(res.data.payload ?? {});
     const unsubscribeLinks = this.parseUnsubscribeLinks(headersMap, body);
+    const attachments = this.extractAttachments(res.data.payload ?? {});
 
     return {
       id: res.data.id!,
@@ -132,6 +140,7 @@ export class GmailService {
       labelIds: res.data.labelIds ?? [],
       headers: headersMap,
       unsubscribeLinks,
+      attachments,
     };
   }
 
@@ -340,6 +349,28 @@ export class GmailService {
   // -----------------------------------------------------------------------
   // Helpers
   // -----------------------------------------------------------------------
+
+  private extractAttachments(
+    payload: gmail_v1.Schema$MessagePart
+  ): AttachmentMeta[] {
+    const results: AttachmentMeta[] = [];
+
+    if (payload.filename && payload.filename.trim() !== "") {
+      results.push({
+        filename: payload.filename,
+        attachmentId: payload.body?.attachmentId ?? "",
+        mimeType: payload.mimeType ?? "",
+      });
+    }
+
+    if (payload.parts) {
+      for (const part of payload.parts) {
+        results.push(...this.extractAttachments(part));
+      }
+    }
+
+    return results;
+  }
 
   private extractBody(payload: gmail_v1.Schema$MessagePart): string {
     // Prefer text/plain, fall back to text/html
