@@ -71,7 +71,6 @@ export class GmailService {
     const messageIds = res.data.messages ?? [];
     if (messageIds.length === 0) return [];
 
-    // Fetch headers for each message in parallel (batched)
     const summaries = await Promise.all(
       messageIds.map((m) => this.getEmailSummary(m.id!))
     );
@@ -145,6 +144,90 @@ export class GmailService {
   }
 
   // -----------------------------------------------------------------------
+  // send_email — compose and send a new email
+  // -----------------------------------------------------------------------
+
+  async sendEmail(
+    to: string,
+    subject: string,
+    body: string,
+    cc?: string,
+    bcc?: string
+  ): Promise<{ messageId: string; threadId: string }> {
+    const headerLines = [
+      `MIME-Version: 1.0`,
+      `To: ${to}`,
+      `Subject: ${subject}`,
+      `Content-Type: text/plain; charset="UTF-8"`,
+    ];
+    if (cc) headerLines.push(`Cc: ${cc}`);
+    if (bcc) headerLines.push(`Bcc: ${bcc}`);
+
+    const raw = Buffer.from([...headerLines, "", body].join("\r\n")).toString(
+      "base64url"
+    );
+
+    const res = await this.gmail.users.messages.send({
+      userId: "me",
+      requestBody: { raw },
+    });
+
+    return { messageId: res.data.id!, threadId: res.data.threadId! };
+  }
+
+  // -----------------------------------------------------------------------
+  // reply_to_email — reply to an existing thread
+  // -----------------------------------------------------------------------
+
+  async replyToEmail(
+    messageId: string,
+    body: string,
+    replyAll: boolean = false
+  ): Promise<{ messageId: string; threadId: string }> {
+    const original = await this.getEmail(messageId);
+
+    const originalMessageId =
+      original.headers["Message-ID"] || original.headers["Message-Id"] || "";
+    const existingRefs = original.headers["References"] || "";
+    const references = existingRefs
+      ? `${existingRefs} ${originalMessageId}`
+      : originalMessageId;
+
+    const replySubject = original.subject.startsWith("Re: ")
+      ? original.subject
+      : `Re: ${original.subject}`;
+
+    const to = original.from;
+    const cc =
+      replyAll && original.to
+        ? [original.to, original.headers["Cc"] ?? ""]
+            .filter(Boolean)
+            .join(", ")
+        : undefined;
+
+    const headerLines = [
+      `MIME-Version: 1.0`,
+      `To: ${to}`,
+      `Subject: ${replySubject}`,
+      `In-Reply-To: ${originalMessageId}`,
+      `References: ${references}`,
+      `Content-Type: text/plain; charset="UTF-8"`,
+    ];
+    if (cc) headerLines.push(`Cc: ${cc}`);
+
+    const raw = Buffer.from([...headerLines, "", body].join("\r\n")).toString(
+      "base64url"
+    );
+
+    const res = await this.gmail.users.messages.send({
+      userId: "me",
+      requestBody: { raw, threadId: original.threadId },
+    });
+
+    return { messageId: res.data.id!, threadId: res.data.threadId! };
+  }
+
+  // -----------------------------------------------------------------------
   // archive_email — remove INBOX label
   // -----------------------------------------------------------------------
 
@@ -152,9 +235,38 @@ export class GmailService {
     await this.gmail.users.messages.modify({
       userId: "me",
       id: messageId,
-      requestBody: {
-        removeLabelIds: ["INBOX"],
-      },
+      requestBody: { removeLabelIds: ["INBOX"] },
+    });
+    return { success: true };
+  }
+
+  // -----------------------------------------------------------------------
+  // delete_email — move to trash
+  // -----------------------------------------------------------------------
+
+  async trashEmail(messageId: string): Promise<{ success: boolean }> {
+    await this.gmail.users.messages.trash({ userId: "me", id: messageId });
+    return { success: true };
+  }
+
+  // -----------------------------------------------------------------------
+  // mark_as_read / mark_as_unread
+  // -----------------------------------------------------------------------
+
+  async markAsRead(messageId: string): Promise<{ success: boolean }> {
+    await this.gmail.users.messages.modify({
+      userId: "me",
+      id: messageId,
+      requestBody: { removeLabelIds: ["UNREAD"] },
+    });
+    return { success: true };
+  }
+
+  async markAsUnread(messageId: string): Promise<{ success: boolean }> {
+    await this.gmail.users.messages.modify({
+      userId: "me",
+      id: messageId,
+      requestBody: { addLabelIds: ["UNREAD"] },
     });
     return { success: true };
   }
@@ -172,23 +284,45 @@ export class GmailService {
     await this.gmail.users.messages.modify({
       userId: "me",
       id: messageId,
-      requestBody: {
-        addLabelIds: [labelId],
-      },
+      requestBody: { addLabelIds: [labelId] },
     });
 
     return { success: true, labelId };
   }
 
+  // -----------------------------------------------------------------------
+  // remove_label
+  // -----------------------------------------------------------------------
+
+  async removeLabel(
+    messageId: string,
+    labelName: string
+  ): Promise<{ success: boolean }> {
+    const res = await this.gmail.users.labels.list({ userId: "me" });
+    const label = (res.data.labels ?? []).find(
+      (l) => l.name?.toLowerCase() === labelName.toLowerCase()
+    );
+
+    if (!label) {
+      throw new Error(`Label "${labelName}" not found on this account.`);
+    }
+
+    await this.gmail.users.messages.modify({
+      userId: "me",
+      id: messageId,
+      requestBody: { removeLabelIds: [label.id!] },
+    });
+
+    return { success: true };
+  }
+
   private async getOrCreateLabel(labelName: string): Promise<string> {
-    // Check existing labels
     const res = await this.gmail.users.labels.list({ userId: "me" });
     const existing = (res.data.labels ?? []).find(
       (l) => l.name?.toLowerCase() === labelName.toLowerCase()
     );
     if (existing) return existing.id!;
 
-    // Create new label
     const created = await this.gmail.users.labels.create({
       userId: "me",
       requestBody: {
@@ -265,7 +399,7 @@ export class GmailService {
           method: "header-mailto",
           detail: `Sent unsubscribe email to ${mailtoAddr}`,
         };
-      } catch (err) {
+      } catch {
         // Fall through
       }
     }
@@ -291,7 +425,7 @@ export class GmailService {
       }
     }
 
-    // 5. Nothing worked — return the links we found so Claude can inform the user
+    // 5. Nothing worked — return links the user can try manually
     const allLinks = [...httpLinks, ...bodyLinks];
     return {
       success: false,
@@ -304,7 +438,6 @@ export class GmailService {
   }
 
   private async sendUnsubscribeMail(toAddress: string): Promise<void> {
-    // Compose a minimal unsubscribe email
     const raw = Buffer.from(
       [
         `To: ${toAddress}`,
@@ -313,8 +446,7 @@ export class GmailService {
         "",
         "Unsubscribe",
       ].join("\r\n")
-    )
-      .toString("base64url");
+    ).toString("base64url");
 
     await this.gmail.users.messages.send({
       userId: "me",
@@ -333,7 +465,7 @@ export class GmailService {
     return this.listEmails(query, maxResults);
   }
 
-// -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
   // get_attachment — download attachment bytes as base64
   // -----------------------------------------------------------------------
 
@@ -345,7 +477,7 @@ export class GmailService {
     });
     return res.data.data ?? "";
   }
-  
+
   // -----------------------------------------------------------------------
   // Helpers
   // -----------------------------------------------------------------------
@@ -373,7 +505,6 @@ export class GmailService {
   }
 
   private extractBody(payload: gmail_v1.Schema$MessagePart): string {
-    // Prefer text/plain, fall back to text/html
     if (payload.mimeType === "text/plain" && payload.body?.data) {
       return Buffer.from(payload.body.data, "base64url").toString("utf-8");
     }
@@ -382,21 +513,17 @@ export class GmailService {
       return Buffer.from(payload.body.data, "base64url").toString("utf-8");
     }
 
-    // Multipart: recurse
     if (payload.parts) {
-      // Try text/plain first
       for (const part of payload.parts) {
         if (part.mimeType === "text/plain" && part.body?.data) {
           return Buffer.from(part.body.data, "base64url").toString("utf-8");
         }
       }
-      // Fall back to text/html
       for (const part of payload.parts) {
         if (part.mimeType === "text/html" && part.body?.data) {
           return Buffer.from(part.body.data, "base64url").toString("utf-8");
         }
       }
-      // Recurse into nested multipart
       for (const part of payload.parts) {
         const result = this.extractBody(part);
         if (result) return result;
@@ -412,14 +539,12 @@ export class GmailService {
   ): string[] {
     const links: string[] = [];
 
-    // From List-Unsubscribe header
     const listUnsub = headers["List-Unsubscribe"] ?? "";
     links.push(...this.extractHttpLinks(listUnsub));
 
     const mailtoMatch = listUnsub.match(/mailto:([^>,\s]+)/i);
     if (mailtoMatch) links.push(`mailto:${mailtoMatch[1]}`);
 
-    // From body
     links.push(...this.extractUnsubscribeLinksFromBody(body));
 
     return [...new Set(links)];
@@ -432,14 +557,12 @@ export class GmailService {
 
   private extractUnsubscribeLinksFromBody(body: string): string[] {
     const links: string[] = [];
-    // Match href links near "unsubscribe" text
     const hrefPattern =
       /href\s*=\s*["']?(https?:\/\/[^"'\s>]+(?:unsubscribe|opt.?out|remove|manage.?preferences)[^"'\s>]*)["']?/gi;
     let match;
     while ((match = hrefPattern.exec(body)) !== null) {
       links.push(match[1]);
     }
-    // Also match plain URLs with unsubscribe keywords
     const urlPattern =
       /(https?:\/\/\S+(?:unsubscribe|opt.?out|remove|manage.?preferences)\S*)/gi;
     while ((match = urlPattern.exec(body)) !== null) {
