@@ -24,4 +24,4 @@ Rules of thumb:
 3. The orchestrator (Fable) should delegate mechanical work rather than doing it inline, to conserve its budget for planning and review.
 4. Run `/agents` to inspect, edit, or add subagents defined in `.claude/agents/`.
 
-See `.claude/agents/deep-reasoner.md` and `.claude/agents/fast-worker.md` for the subagent definitions.
+See `.claude/agents/deep-reasoner.md` and `.claude/agents/fast-worker.md` for the subagent definitions, and `.claude/skills/delegate-work/` for the decision procedure that enforces this routing before non-trivial tasks.
